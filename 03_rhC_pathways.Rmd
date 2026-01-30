@@ -1,0 +1,223 @@
+---
+title: "03_rhC_pathways"
+output: html_document
+date: "2025-12-09"
+---
+
+# Load packages
+```{r}
+library(mia)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(survival)
+library(survminer)
+library(writexl)
+library(table1)
+library(ggplot2)
+library(ggthemes)
+```
+
+```{r}
+# Read tse data
+
+tse <- readRDS("/media/project_2013220/TSE-objects/TSE_updated/tse_greengenes2_MGS.rds")
+
+
+#Define covariates 
+covs_nicenames <- 
+      c(BL_AGE            = "Age",                
+        MEN               = "Men",                
+        BMI               = "BMI",
+        CURR_SMOKE        = "Smoking",            
+        ALKI2_FR02        = "Alcohol",                 
+        Q57X              = "Physical activity",  
+        PREVAL_DIAB       = "Diabetes",           
+        PREVAL_CVD        = "CVD",                
+        PREVAL_CR_ANYCANC = "Cancer")            
+              
+    covs_names <- names(covs_nicenames)
+    covs_formula <- paste(covs_names, collapse = " + ")
+    
+# Change colData to data frame and filter by removing pregnant women, low reads, and NAs covars.
+
+col_data <- as.data.frame(colData(tse)) 
+col_data_filtered <- col_data %>% filter(PROJECT == "FR02") 
+col_data_filtered <- col_data_filtered %>% filter((GRAVID == 1 | is.na(GRAVID)) & 
+                                                    (total_reads > 50000) & 
+                                                    (BL_USE_RX_J01_1mo == 0) & 
+                                                    (PREVAL_M13_RHEUMA == 0) & 
+                                                    (PREVAL_SCTD == 0) & 
+                                                    (PREVAL_M13_ANKYLOSPON == 0)) %>% 
+                                            filter(if_all(all_of(covs_names), ~ !is.na(.))) %>% 
+                                            mutate(INCIDENT_RSCA = ifelse(INCIDENT_M13_RHEUMA == 1 | INCIDENT_SCTD == 1 | INCIDENT_M13_ANKYLOSPON == 1, 1, 0 )) %>% 
+                                            mutate(RSCA_AGEDIFF = pmin(M13_RHEUMA_AGEDIFF, M13_ANKYLOSPON_AGEDIFF, SCTD_AGEDIFF))
+col_data_rownames <- col_data_filtered %>% rownames()
+
+# Subset tse object by filtered rownames  and update col data 
+tse_subset <- tse[, col_data_rownames]
+SummarizedExperiment::colData(tse_subset) <- S4Vectors::DataFrame(col_data_filtered)
+
+# Functional pathways from metaCyc
+joined_pathabundance <- read.delim("/home/diabhass/Projects/SD-Connect/project_2013220/Hassan/joined_pathabundance.tsv")
+# Matching sampleID from functional data to metadata
+
+  # Convert filtered colData to data frame
+  tse_subset_coldata <- as.data.frame(colData(tse_subset))
+
+  # Get the column names (excluding the first one, which is probably the path/feature column)
+  sample_names <- colnames(joined_pathabundance)[-1]
+
+  # Clean sample names by removing after .R1
+  cleaned_sample_names <- gsub("\\.R1.*","", sample_names, perl = TRUE)
+  cleaned_sample_names <- gsub("X", "", cleaned_sample_names)
+  cleaned_sample_names <- gsub("\\.", "-", cleaned_sample_names) # !! note to self: remember that we if we have BLANK IDs then we can't change "." to "-"
+
+  # Update the column names with the cleaned sample names
+  colnames(joined_pathabundance)[-1] <- cleaned_sample_names
+  
+
+  # Find the intersection of sample names between the cleaned joined_path_abundance sample names and FINRISK sample data
+  common_samples <- intersect(tse_subset_coldata$Barcode, cleaned_sample_names)
+
+  # Subset the joined_pathabundance file to include only the common samples
+ joined_pathabundance <- joined_pathabundance %>% 
+   select(all_of(c("Pathway", common_samples)))
+
+```
+
+```{r}
+# Keep "whole pathways" only and remove non-bacterial pathways
+filter_sp <- joined_pathabundance %>% 
+  filter(rowSums(across(where(is.numeric)))!=0) %>%
+  filter(!grepl("\\.s_|superpathway|UNMAPPED|UNINTEGRATED|unclassified|fungi|archaea|mammalian|plant|yeast|eukaryotes|eukaryotic|invertebrates", Pathway))
+
+# Transpose dataframe
+filter_sp.t <- as.data.frame(t(filter_sp))
+
+# Take first row as colname
+colnames(filter_sp.t) <- filter_sp.t[1,]
+
+# Remove extra row
+filter_sp.t <- filter_sp.t[-1, ] 
+
+# Change from character to numeric
+filter_sp.t <- filter_sp.t %>% mutate_if(is.character, as.numeric) %>%
+  tibble::rownames_to_column("Barcode") 
+
+```
+
+
+```{r}
+# Prevalence filtering
+# You will get a dataframe of prevalent pathways
+filter_sp.10 <- filter_sp.t %>% 
+  select(-1) %>%
+  #mutate to 1 for everything > 0.0000000001
+  mutate(across(everything(), ~ . > 10^-10)) %>%
+  #get proportion
+  summarize(across(everything(), mean)) %>%
+  tidyr::gather(Pathway,prevalence) %>%
+  #filter for pathways that are prevalent in 5%
+  dplyr::filter(prevalence > 0.05)  
+
+# Filtered to only prevalent pathways
+filter_sp_pr <- filter_sp.10 %>% 
+  select(-2) %>%
+  dplyr::inner_join(filter_sp, by="Pathway" ) %>%
+  t() %>%
+  as.data.frame()
+
+# Take first row as colname
+colnames(filter_sp_pr) <- filter_sp_pr[1,]
+# Remove extra row
+filter_sp_pr <- filter_sp_pr[-1, ] 
+# Change from character to numeric
+filter_sp_pr <- filter_sp_pr %>% mutate_if(is.character, as.numeric) %>%
+  tibble::rownames_to_column("Barcode")  
+
+```
+
+
+Run analysis for dichotomized data 
+```{r}
+# Reduce to dichotomous variables (absence / presence)
+dicho <- filter_sp_pr %>% 
+  mutate(across(where(is.numeric), ~ ifelse(. > 0, 1, 0)))
+
+#Match samples with tse
+df_dicho <- dplyr::inner_join(dicho, tse_subset_coldata, by = "Barcode")
+
+# Store pathway names
+pathways <- filter_sp_pr %>% select (-Barcode) %>% colnames()
+
+#include total_Reads as covars
+
+covs_nicenames_totalreads <- 
+      c(BL_AGE            = "Age",                #Age at the time of sample collection
+        MEN               = "Men",                #Is person a men
+        BMI               = "BMI",
+        CURR_SMOKE        = "Smoking",            
+        ALKI2_FR02        = "Alcohol",             #Alcohol usage
+        Q57X              = "Physical activity",  #Physical activity
+        PREVAL_DIAB       = "Diabetes",           #Prevalent diabetes
+        PREVAL_CVD        = "CVD",                #Prevalent CVD
+        PREVAL_CR_ANYCANC = "Cancer",
+        total_reads       = "Reads") 
+
+# Run cox model for all covars using dichotomized data 
+cox_model_fun_pathway_dicho_covars <- expand.grid(pathways = pathways) %>% 
+  mutate(formula = glue::glue("Surv(RSCA_AGEDIFF, INCIDENT_RSCA) ~ scale(`{pathways}`) + {paste(names(covs_nicenames_totalreads), collapse = ' + ')}")) %>%
+  mutate(model= map(formula, ~ coxph(as.formula (.x), data=df_dicho))) %>%
+  filter(!is.null(model)) %>% 
+  mutate (tidy = map(model, ~ broom::tidy (.x, exponentiate = TRUE, conf.int = TRUE))) %>%
+  unnest (tidy) %>%
+  filter (grepl("scale", term)) %>% 
+  mutate (qvalue = p.adjust(p.value, method = "BH"))%>% 
+  select (-model) %>% 
+  arrange(qvalue)
+
+knitr::kable(cox_model_fun_pathway_dicho_covars)
+writexl::write_xlsx(cox_model_fun_pathway_dicho_covars, "T8_pathways_dicho_covars.xlsx")
+
+saveRDS(cox_model_fun_pathway_dicho_covars, "pathways.rds")
+
+
+```
+
+
+Run analysis for inverse rank transformed data
+```{r}
+# Transform to inverse_rank
+
+  # Define the transformation function
+  transform_column <- function(x) {
+  qnorm((rank(x, na.last = "keep") - 0.5) / sum(!is.na(x)))
+  }
+
+  # Apply the transformation to all columns
+  inv_rank <- filter_sp_pr
+  inv_rank[, -1] <- lapply(filter_sp_pr[, -1], transform_column)
+  
+  df_inv_rank <- dplyr::inner_join(inv_rank, tse_subset_coldata, by = "Barcode")
+
+# Run cox model for all covars using inverse rank transformed data
+
+cox_model_fun_pathway_inv_rank_covars <- expand.grid(pathways = pathways) %>% 
+  mutate(formula = glue::glue("Surv(RSCA_AGEDIFF, INCIDENT_RSCA) ~ scale(`{pathways}`) + {paste(names(covs_nicenames), collapse = ' + ')}")) %>%
+  mutate(model= map(formula, ~ coxph(as.formula (.x), data=df_inv_rank))) %>%
+  filter(!is.null(model)) %>% 
+  mutate (tidy = map(model, ~ broom::tidy (.x, exponentiate = TRUE, conf.int = TRUE))) %>%
+  unnest (tidy) %>%
+  filter (grepl("scale", term)) %>% 
+  mutate (qvalue = p.adjust(p.value, method = "BH"))%>% 
+  select (-model) %>% 
+  arrange(qvalue)
+
+knitr::kable(cox_model_fun_pathway_inv_rank_covars)
+writexl::write_xlsx(cox_model_fun_pathway_inv_rank_covars, "T9_pathways_inverse_rank_covars.xlsx")
+
+```
+
+

@@ -1,0 +1,101 @@
+---
+title: "02a_rhC_perma_covars"
+output: html_document
+date: "2025-11-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE, echo = TRUE, message = FALSE, cache=FALSE, warning=FALSE, error = TRUE)
+```
+
+
+```{r}
+library(mia)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+```
+
+
+```{r}
+# Read tse data
+
+tse <- readRDS("/media/project_2013220/TSE-objects/TSE_updated/tse_greengenes2_MGS.rds")
+
+
+#Define covariates 
+covs_nicenames <- 
+      c(BL_AGE            = "Age",                
+        MEN               = "Men",                
+        BMI               = "BMI",
+        CURR_SMOKE        = "Smoking",            
+        ALKI2_FR02        = "Alcohol",                 
+        Q57X              = "Physical activity",  
+        PREVAL_DIAB       = "Diabetes",           
+        PREVAL_CVD        = "CVD",                
+        PREVAL_CR_ANYCANC = "Cancer")            
+              
+    covs_names <- names(covs_nicenames)
+    covs_formula <- paste(covs_names, collapse = " + ")
+    
+# Change colData to data frame and filter by removing pregnant women, low reads, and NAs covars.
+
+col_data <- as.data.frame(colData(tse)) 
+col_data_filtered <- col_data %>% filter(PROJECT == "FR02") 
+col_data_filtered <- col_data_filtered %>% filter((GRAVID == 1 | is.na(GRAVID)) & 
+                                                    (total_reads > 50000) & 
+                                                    (BL_USE_RX_J01_1mo == 0) & 
+                                                    (PREVAL_M13_RHEUMA == 0) & 
+                                                    (PREVAL_SCTD == 0) & 
+                                                    (PREVAL_M13_ANKYLOSPON == 0)) %>% 
+                                            filter(if_all(all_of(covs_names), ~ !is.na(.))) %>% 
+                                            mutate(INCIDENT_RSCA = ifelse(INCIDENT_M13_RHEUMA == 1 | INCIDENT_SCTD == 1 | INCIDENT_M13_ANKYLOSPON == 1, 1, 0 )) %>% 
+                                            mutate(RSCA_AGEDIFF = pmin(M13_RHEUMA_AGEDIFF, M13_ANKYLOSPON_AGEDIFF, SCTD_AGEDIFF))
+col_data_rownames <- col_data_filtered %>% rownames()
+
+# Subset tse object by filtered rownames  and update col data 
+tse_subset <- tse[, col_data_rownames]
+SummarizedExperiment::colData(tse_subset) <- S4Vectors::DataFrame(col_data_filtered)
+
+# Agglomerate by Species
+tse_subset <- agglomerateByRank(tse_subset, rank = "species")
+
+# Transform count assay to relative abundances
+tse_subset <- transformAssay(tse_subset, assay.type = "counts", method = "relabundance")
+
+```
+
+
+```{r}
+set.seed(198)
+Permanova_rsca <- mia::runRDA(tse_subset, 
+                    assay.type = "relabundance",
+                    formula = assay ~ BL_AGE + 
+                                      MEN +
+                                      BMI +
+                                      CURR_SMOKE +
+                                      ALKI2_FR02 +
+                                      Q57X + 
+                                      PREVAL_DIAB + 
+                                      PREVAL_CVD  + 
+                                      PREVAL_CR_ANYCANC + 
+                                      INCIDENT_RSCA, 
+                    distance = "bray",
+                    na.action = na.exclude)
+saveRDS(Permanova_rsca, "./Permanova_rsca.rds")
+# Store results of PERMANOVA test
+rda_info <- attr(SingleCellExperiment::reducedDim(Permanova_rsca, "RDA"), "significance")
+
+saveRDS (rda_info, "./rda_info.rds")
+
+# rda_info$permanova |>
+  knitr::kable() %>%
+  write("./permanova-HTN-full_rhC_covars.csv")
+
+rda_info$homogeneity |>
+  knitr::kable() %>%
+  write.csv("homogeneity-HTN-full_rhC_covars.csv")
+
+```
+
